@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import os
 import sys
 import logging
 
@@ -24,6 +24,7 @@ import tensorflow as tf
 from tensorflow import keras
 import keras
 from keras.models import load_model
+import mxnet as mx
 import pandas as pd
 from .RMT_Util import *
 #from RMT_Util import *
@@ -42,8 +43,7 @@ def main():
 class WeightWatcher:
 
     def __init__(self, model=None, log=True, logger=None):
-        self.model = self.load_model(model)
-#        self.alphas = {}
+        self.model, self.framework = self.load_model(model)
         self.results = {}
         self.summary = {}
         self.logger_set(log=log, logger=logger)
@@ -74,8 +74,6 @@ class WeightWatcher:
 
     def header(self):
         """WeightWatcher v0.1.dev0 by Calculation Consulting"""
-#        from weightwatcher import __name__, __version__, __author__, __description__, __url__
-#        return "{} v{} by {}\n{}\n{}".format(__name__, __version__, __author__, __description__, __url__)
         return ""
 
     def banner(self):
@@ -83,6 +81,9 @@ class WeightWatcher:
         versions += "\nnumpy       version {}".format(np.__version__)
         versions += "\ntensforflow version {}".format(tf.__version__)
         versions += "\nkeras       version {}".format(keras.__version__)
+        versions += "\nmxnet       version {}".format(mx.__version__)
+        if self.framework != FRAMEWORK.UNKNOWN:
+            versions += f"\nUSING {self.framework}!"
         return "\n{}{}".format(self.header(), versions)
 
 
@@ -113,16 +114,29 @@ class WeightWatcher:
 
 
     def load_model(self, model):
-        """Load a model from a file if necessary.
+        """Load a model from a file if necessary and detect framework if possible
         """
         res = model
+        framework = FRAMEWORK.UNKNOWN
         if isinstance(model, str):
             if os.path.isfile(model):
                 self.info("Loading model from file '{}'".format(model))
                 res = load_model(model)
+                framework = FRAMEWORK.KERAS
             else:
-                self.error("Loading model from file '{}': file not found".format(model))
-        return res
+                # mxnet uses a non path specification as standard - path up to the model name,
+                if "," in model:
+                    parts = model.split(',')
+                    full_path = f"{parts[0]}-{int(parts[1]):04d}.params"
+                    if os.path.isfile(full_path):
+                        self.info("Loading model from file '{}'".format(full_path))
+                        _, res, _ = mx.model.load_checkpoint(parts[0], int(parts[1]))
+                        framework = FRAMEWORK.MXNET
+                    else:
+                        self.error("Loading model from file '{}': file not found".format(full_path))
+                else:
+                    self.error("Loading model from file '{}': file not found".format(model))
+        return res, framework
 
 
     def model_is_valid(self, model=None):
@@ -136,7 +150,7 @@ class WeightWatcher:
     # test with https://github.com/osmr/imgclsmob/blob/master/README.md
     def analyze(self, model=None, layers=[], min_size=50, max_size=0,
                 alphas=False, lognorms=True, spectralnorms=False, softranks=False,
-                normalize=False, glorot_fix=False, plot=False, mp_fit=False):
+                normalize=False, glorot_fix=False, plot=False, mp_fit=False, mxnet_hints={"dense": "fc", "conv1d": "conv1d", "conv2d": "conv2d"}):
         """
         Analyze the weight matrices of a model.
 
@@ -192,8 +206,11 @@ class WeightWatcher:
         if not self.model_is_valid(model):
             self.error("Invalid model")
             return res
-
-        if hasattr(model, 'name'):
+        
+        if isinstance(model, dict):
+            # mxnet uses a plain python dict to store weights as the value and name of layer as key
+            self.info("Analyzing model with {} layers".format(len(model.keys())))
+        elif hasattr(model, 'name'):
             # keras has a 'name' attribute on the model
             self.info("Analyzing model '{}' with {} layers".format(model.name, len(model.layers)))
         else:
@@ -203,17 +220,21 @@ class WeightWatcher:
         weights = []
         
         layers = []
-        if hasattr(model, 'layers'):
+        if isinstance(model, dict):
+            # mxnet
+            layers = model.keys()
+            self.framework = FRAMEWORK.MXNET
+        elif hasattr(model, 'layers'):
             # keras
             layers = model.layers
-        else:
+            self.framework = FRAMEWORK.KERAS
+        else:                        
             # pyTorch
             layers = model.modules()
-            
+            self.framework = FRAMEWORK.PYTORCH
         import torch.nn as nn
-
         for i, l in enumerate(layers):
-            self.debug("Layer {}: {}".format(i+1, l))
+            self.debug("Layer {}: {}".format(i+1, l))            
             res[i] = {"id": i}
             res[i]["type"] = l
             
@@ -226,8 +247,8 @@ class WeightWatcher:
                 res[i]["message"] = msg
                 continue
 
-            # DENSE layer (Keras) / LINEAR (pytorch)
-            if isinstance(l, keras.layers.core.Dense) or isinstance(l, nn.Linear):
+            # DENSE layer (Keras) / LINEAR (pytorch) / FULLYCONNECTED (mxnet)
+            if isinstance(l, keras.layers.core.Dense) or isinstance(l, nn.Linear) or (isinstance(l, str) and mxnet_hints["dense"] in l and "weight" in l):
 
                 res[i]["layer_type"] = LAYER_TYPE.DENSE
 
@@ -243,6 +264,9 @@ class WeightWatcher:
                     # pyTorch
                     weights = [np.array(l.weight.data.clone().cpu())]
                     receptive_field_size = l.weight.data[0][0].numel()
+                elif isinstance(l, str):
+                    # mxnet
+                    weights = model[l].asnumpy()
                 else:
                     # keras
                     weights = l.get_weights()[0:1] # keep only the weights and not the bias
@@ -251,12 +275,18 @@ class WeightWatcher:
                     # TODO: add option to append bias matrix
                     #if add_bias:
                     #    weights = weigths[0]+weights[1]
-
-                if weights[0].shape[1] < 2:
-                    msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
-                    self.debug("Layer {}: {}".format(i+1, msg))
-                    res[i]["message"] = msg
-                    continue
+                if len(weights[0].shape) == 1:
+                    if weights[0].shape[0] < 2:
+                        msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
+                        self.debug("Layer {}: {}".format(i+1, msg))
+                        res[i]["message"] = msg
+                        continue
+                else:
+                    if weights[0].shape[1] < 2:
+                        msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
+                        self.debug("Layer {}: {}".format(i+1, msg))
+                        res[i]["message"] = msg
+                        continue
 
             # CONV1D layer
             elif (isPyTorchLinearOrConv1D(l)):
@@ -295,9 +325,28 @@ class WeightWatcher:
                     self.debug("Layer {}: {}".format(i+1, msg))
                     res[i]["message"] = msg
                     continue
+            # MXNET CONV1D
+            elif isinstance(l, str) and mxnet_hints["conv1d"] in l and "weight" in l:
                 
+                res[i] = {"layer_type": LAYER_TYPE.CONV1D}
+
+                if (len(layer_types) > 0 and
+                        not any(layer_type & LAYER_TYPE.CONV1D for layer_type in layer_types)):
+                    msg = "Skipping (Layer type not requested to analyze)"
+                    self.debug("Layer {}: {}".format(i+1, msg))
+                    res[i]["message"] = msg
+                    continue
+                
+                weights = model[l].asnumpy()
+
+                if weights[0].shape[0] < 2:
+                    msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
+                    self.debug("Layer {}: {}".format(i+1, msg))
+                    res[i]["message"] = msg
+                    continue
+
             # CONV2D layer
-            elif isinstance(l, keras.layers.convolutional.Conv2D) or isinstance(l, nn.Conv2d):
+            elif isinstance(l, keras.layers.convolutional.Conv2D) or isinstance(l, nn.Conv2d) or (isinstance(l, str) and mxnet_hints["conv2d"] in l and "weight" in l):
 
                 res[i] = {"layer_type": LAYER_TYPE.CONV2D}
 
@@ -309,19 +358,28 @@ class WeightWatcher:
                     continue
                 
                 if isinstance(l, nn.Conv2d):
-                    w = [np.array(l.weight.data.clone().cpu())]
+                    w = [np.array(l.weight.data.clone().cpu())][0]
                     receptive_field_size = l.weight.data[0][0].numel()
+                elif isinstance(l, str):
+                    # mxnet
+                    w = model[l].asnumpy()
                 else:
-                    w = l.get_weights()
+                    w = l.get_weights()[0]
                     
-                weights = self.get_conv2D_Wmats(w[0])
-                
-                if weights[0].shape[1] < 2:
-                    msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
-                    self.debug("Layer {}: {}".format(i+1, msg))
-                    res[i]["message"] = msg
-                    continue
-                
+                weights = self.get_conv2D_Wmats(w)
+
+                if len(weights[0].shape) == 1:
+                    if weights[0].shape[0] < 2:
+                        msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
+                        self.debug("Layer {}: {}".format(i+1, msg))
+                        res[i]["message"] = msg
+                        continue
+                else:
+                    if weights[0].shape[1] < 2:
+                        msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
+                        self.debug("Layer {}: {}".format(i+1, msg))
+                        res[i]["message"] = msg
+                        continue
             else:
                 msg = "Skipping (Layer not supported)"
                 self.debug("Layer {}: {}".format(i+1, msg))
@@ -531,7 +589,7 @@ class WeightWatcher:
         s = Wtensor.shape
         N, M, imax, jmax = s[0],s[1],s[2],s[3]
         if N + M >= imax + jmax:
-            self.debug("Pytorch tensor shape detected: {}x{} (NxM), {}x{} (i,j)".format(N, M, imax, jmax))
+            self.debug("Pytorch or MXNet tensor shape detected: {}x{} (NxM), {}x{} (i,j)".format(N, M, imax, jmax))
             
             for i in range(imax):
                 for j in range(jmax):
@@ -549,6 +607,7 @@ class WeightWatcher:
                     if N < M:
                         W = W.T
                     Wmats.append(W)
+
             
         return Wmats
 

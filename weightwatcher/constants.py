@@ -28,3 +28,9 @@ class LEVEL(Enum):
     SLICE = auto()
     LAYER = auto()
     NETWORK = auto()
+
+class FRAMEWORK(Enum):
+    UNKNOWN = auto()
+    KERAS = auto()
+    PYTORCH = auto()
+    MXNET = auto()
