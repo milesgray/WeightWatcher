@@ -24,6 +24,8 @@ import tensorflow as tf
 from tensorflow import keras
 import keras
 from keras.models import load_model
+import torch
+import torch.nn as nn
 import mxnet as mx
 import pandas as pd
 from .RMT_Util import *
@@ -43,11 +45,11 @@ def main():
 class WeightWatcher:
 
     def __init__(self, model=None, log=True, logger=None):
+        self.logger_set(log=log, logger=logger)
         self.model, self.framework = self.load_model(model)
         self.results = {}
         self.summary = {}
-        self.logger_set(log=log, logger=logger)
-
+    
         self.info(self.banner())
 
 
@@ -83,7 +85,7 @@ class WeightWatcher:
         versions += "\nkeras       version {}".format(keras.__version__)
         versions += "\nmxnet       version {}".format(mx.__version__)
         if self.framework != FRAMEWORK.UNKNOWN:
-            versions += f"\nUSING {self.framework}!"
+            versions += "\nUSING {}!".format(self.framework)
         return "\n{}{}".format(self.header(), versions)
 
 
@@ -127,7 +129,7 @@ class WeightWatcher:
                 # mxnet uses a non path specification as standard - path up to the model name,
                 if "," in model:
                     parts = model.split(',')
-                    full_path = f"{parts[0]}-{int(parts[1]):04d}.params"
+                    full_path = "{}-{04d}.params".format(parts[0], int(parts[1]))
                     if os.path.isfile(full_path):
                         self.info("Loading model from file '{}'".format(full_path))
                         _, res, _ = mx.model.load_checkpoint(parts[0], int(parts[1]))
@@ -136,6 +138,18 @@ class WeightWatcher:
                         self.error("Loading model from file '{}': file not found".format(full_path))
                 else:
                     self.error("Loading model from file '{}': file not found".format(model))
+        elif isinstance(model, dict):
+            self.info("MXNet model detected")
+            framework = FRAMEWORK.MXNET
+        elif hasattr(model, 'layers'):
+            self.info("Keras model detected")
+            framework = FRAMEWORK.KERAS
+        elif hasattr(model, 'modules'):
+            self.info("PyTorch model detected")
+            framework = FRAMEWORK.PYTORCH
+        else:
+            self.info("Model is an unkown type!")
+        
         return res, framework
 
 
@@ -150,7 +164,7 @@ class WeightWatcher:
     # test with https://github.com/osmr/imgclsmob/blob/master/README.md
     def analyze(self, model=None, layers=[], min_size=50, max_size=0,
                 alphas=False, lognorms=True, spectralnorms=False, softranks=False,
-                normalize=False, glorot_fix=False, plot=False, mp_fit=False, mxnet_hints={"dense": "fc", "conv1d": "conv1d", "conv2d": "conv2d"}):
+                normalize=False, glorot_fix=False, plot=False, mp_fit=False, mxnet_hints={"dense": ["fc"], "conv1d": ["conv1d"], "conv2d": ["conv2d"]}):
         """
         Analyze the weight matrices of a model.
 
@@ -175,6 +189,8 @@ class WeightWatcher:
             Compute the soft norm (i.e. StableRank) of the weight matrices.
         mp_fit:
             Compute the best Marchenko-Pastur fit of each weight matrix ESD
+        mxnet_hints:
+            Dictionary with list of strings that are used to identify layer type based on the names of layers, there is no standard so this must be set based on the convention used for a particular model
         """
 
         model = model or self.model        
@@ -192,7 +208,6 @@ class WeightWatcher:
                     if isinstance(l, nn.modules.batchnorm._BatchNorm):
                         return False
                     w = l.weight.detach().numpy()
-#                    tf = True
                     if len(w.shape)==2: # Linear
                         if w.shape[1] >= 2:
                             tf = True
@@ -210,29 +225,29 @@ class WeightWatcher:
         if isinstance(model, dict):
             # mxnet uses a plain python dict to store weights as the value and name of layer as key
             self.info("Analyzing model with {} layers".format(len(model.keys())))
+            self.framework = FRAMEWORK.MXNET
         elif hasattr(model, 'name'):
             # keras has a 'name' attribute on the model
             self.info("Analyzing model '{}' with {} layers".format(model.name, len(model.layers)))
+            self.framework = FRAMEWORK.KERAS
         else:
             # pyTorch has no 'name'
             self.info("Analyzing model")
+            self.framework = FRAMEWORK.PYTORCH
 
         weights = []
         
         layers = []
         if isinstance(model, dict):
             # mxnet
-            layers = model.keys()
-            self.framework = FRAMEWORK.MXNET
+            layers = model.keys()            
         elif hasattr(model, 'layers'):
             # keras
-            layers = model.layers
-            self.framework = FRAMEWORK.KERAS
+            layers = model.layers            
         else:                        
             # pyTorch
-            layers = model.modules()
-            self.framework = FRAMEWORK.PYTORCH
-        import torch.nn as nn
+            layers = model.modules()            
+        
         for i, l in enumerate(layers):
             self.debug("Layer {}: {}".format(i+1, l))            
             res[i] = {"id": i}
@@ -248,7 +263,7 @@ class WeightWatcher:
                 continue
 
             # DENSE layer (Keras) / LINEAR (pytorch) / FULLYCONNECTED (mxnet)
-            if isinstance(l, keras.layers.core.Dense) or isinstance(l, nn.Linear) or (isinstance(l, str) and mxnet_hints["dense"] in l and "weight" in l):
+            if isinstance(l, keras.layers.core.Dense) or isinstance(l, nn.Linear) or (isinstance(l, str) and any([h in l for h in mxnet_hints["dense"]]) and "weight" in l):
 
                 res[i]["layer_type"] = LAYER_TYPE.DENSE
 
@@ -269,12 +284,7 @@ class WeightWatcher:
                     weights = model[l].asnumpy()
                 else:
                     # keras
-                    weights = l.get_weights()[0:1] # keep only the weights and not the bias
-#                    weights = l.get_weights()[0:1]  #Keras default Glorot uniform
-                    
-                    # TODO: add option to append bias matrix
-                    #if add_bias:
-                    #    weights = weigths[0]+weights[1]
+                    weights = l.get_weights()[0:1] 
                 if len(weights[0].shape) == 1:
                     if weights[0].shape[0] < 2:
                         msg = "Skipping (Found array with 1 feature(s) while a minimum of 2 is required)"
@@ -326,7 +336,7 @@ class WeightWatcher:
                     res[i]["message"] = msg
                     continue
             # MXNET CONV1D
-            elif isinstance(l, str) and mxnet_hints["conv1d"] in l and "weight" in l:
+            elif isinstance(l, str) and any([h in l for h in mxnet_hints["conv1d"]]) and "weight" in l:
                 
                 res[i] = {"layer_type": LAYER_TYPE.CONV1D}
 
@@ -346,7 +356,7 @@ class WeightWatcher:
                     continue
 
             # CONV2D layer
-            elif isinstance(l, keras.layers.convolutional.Conv2D) or isinstance(l, nn.Conv2d) or (isinstance(l, str) and mxnet_hints["conv2d"] in l and "weight" in l):
+            elif isinstance(l, keras.layers.convolutional.Conv2D) or isinstance(l, nn.Conv2d) or (isinstance(l, str) and any([h in l for h in mxnet_hints["conv2d"]]) and "weight" in l):
 
                 res[i] = {"layer_type": LAYER_TYPE.CONV2D}
 
@@ -588,6 +598,7 @@ class WeightWatcher:
         Wmats = []
         s = Wtensor.shape
         N, M, imax, jmax = s[0],s[1],s[2],s[3]
+    
         if N + M >= imax + jmax:
             self.debug("Pytorch or MXNet tensor shape detected: {}x{} (NxM), {}x{} (i,j)".format(N, M, imax, jmax))
             
@@ -607,8 +618,7 @@ class WeightWatcher:
                     if N < M:
                         W = W.T
                     Wmats.append(W)
-
-            
+                
         return Wmats
 
 
@@ -732,8 +742,12 @@ class WeightWatcher:
                 try:
                     svd.fit(W) 
                 except:
-                    W = W.astype(float)
-                    svd.fit(W)
+                    try:
+                        W = W.astype(float)
+                        svd.fit(W)
+                    except Exception as e:
+                        self.info("Error calculating alphas for layer {} (shape: {}): {}".format(i, W.shape, e))
+                        continue
                     
                 sv = svd.singular_values_
                 sv_max = np.max(sv)
@@ -749,7 +763,7 @@ class WeightWatcher:
                 lambda_max = np.max(evals)
                 fit = powerlaw.Fit(evals, xmax=lambda_max, verbose=False)
                 alpha = fit.alpha 
-                res[i]["alpha"] = alpha
+                res[i]["alpha"] = alphacount = len(weights)
                 D = fit.D
                 res[i]["D"] = D
                 res[i]["lambda_min"] = np.min(evals)
@@ -773,30 +787,19 @@ class WeightWatcher:
                     fit.power_law.plot_pdf(color='b', linestyle='--', ax=fig2)
                     fit.plot_ccdf(color='r', linewidth=2, ax=fig2)
                     fit.power_law.plot_ccdf(color='r', linestyle='--', ax=fig2)
-#                    plt.title("Power law fit for Weight matrix {}/{} (layer ID: {})".format(i+1, count, layerid))
                     plt.title("Power law fit for Weight matrix {}/{} (layer ID: {})\n".format(i+1, count, layerid) + r"$\alpha$={0:.3f}; ".format(alpha) + r"KS_distance={0:.3f}".format(D))                    
                     plt.show()
 
                     # plot eigenvalue histogram
                     plt.hist(evals, bins=100, density=True)
-#                    plt.title(r"ESD (Empirical Spectral Density) $\rho(\lambda)$" + " for Weight matrix {}/{} (layer ID: {})".format(i+1, count, layerid))
                     plt.title(r"ESD (Empirical Spectral Density) $\rho(\lambda)$" + "\nfor Weight matrix ({}x{}) {}/{} (layer ID: {})".format(N, M, i+1, count, layerid))                    
                     plt.show()
 
                     plt.loglog(evals)
-#                    plt.title("Eigen Values for Weight matrix {}/{} (layer ID: {})".format(i+1, count, layerid))
                     plt.title("Logscaling Plot of Eigenvalues\nfor Weight matrix ({}X{}) {}/{} (layer ID: {})".format(N, M, i+1, count, layerid))
                     plt.show()
                 
             if mp_fit:
-#                if Q == 1:
-#                    ## Quarter-Circle Law
-#                    sv = svd.singular_values_
-#                    to_plot = np.sqrt(sv*sv/N)
-#                else:
-#                    to_plot = sv*sv/N
-#                w_unnorm = W*np.sqrt(N + M)/np.sqrt(2*N)
-                
                 if not alphas:
                     #W = self.normalize(W, N, M, count)
                     svd = TruncatedSVD(n_components=M-1, n_iter=7, random_state=10)
@@ -811,8 +814,6 @@ class WeightWatcher:
                 to_plot = evals.copy()
                 
                 bw = 0.1
-#                s1, f1 = RMT_Util.fit_mp(to_plot, Q, bw = 0.01)  
-#                s1, f1 = fit_density(to_plot, Q, bw = bw)  
                 s1, f1 = fit_density_with_range(to_plot, Q, bw = bw)
                 
                 res[i]['sigma_mp'] = s1
@@ -839,8 +840,6 @@ class WeightWatcher:
                         
                     else:
                         fit_law = 'MP ESD'
-#                        RMT_Util.plot_ESD_and_fit(model=None, eigenvalues=to_plot, 
-#                                                  Q=Q, num_spikes=0, sigma=s1)
                     plot_density_and_fit(model=None, eigenvalues=to_plot, 
                                          Q=Q, num_spikes=0, sigma=s1, verbose = False)
                     plt.title("{}, sigma auto-fit for Weight matrix {}/{} (layer ID: {})\nsigma_fit = {}, softrank_mp = {}".format(fit_law, i+1, count, layerid, round(s1, 6), round(softrank_mp, 3)))
